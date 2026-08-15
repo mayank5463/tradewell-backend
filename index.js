@@ -69,7 +69,12 @@ app.set("trust proxy", 1);
 app.use(helmet());
 
 // ── CORS setup ────────────────────────────────────────────────────────────
+// ── CORS setup ────────────────────────────────────────────────────────────
 const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "https://tradewell-marketing.vercel.app",
+  "https://tradewell-dashboard.vercel.app",
   process.env.FRONTEND_URL,
   process.env.DASHBOARD_URL,
 ].filter(Boolean);
