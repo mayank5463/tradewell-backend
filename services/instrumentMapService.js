@@ -1,20 +1,15 @@
-
 const https = require("https");
 const zlib = require("zlib");
 
 const INSTRUMENT_MASTER_URL =
   "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
 
-// In-memory cache: { "RELIANCE": { instrumentKey, name, logoUrl, instrumentType }, ... }
 let symbolToInstrumentKey = {};
 let lastRefreshedAt = null;
-
-
 let equitySymbols = [];
 
-
 const INDEX_DEFINITIONS = [
-
+  { key: "NIFTY50", segment: "NSE_INDEX", match: /^nifty\s?50$/i },
   { key: "SENSEX", segment: "BSE_INDEX", match: /^(s&p\s+)?bse\s*sensex$/i },
   { key: "NIFTYBANK", segment: "NSE_INDEX", match: /^nifty\s?bank$/i },
   { key: "NIFTYIT", segment: "NSE_INDEX", match: /^nifty\s?it$/i },
@@ -26,6 +21,14 @@ const INDEX_DEFINITIONS = [
   { key: "NIFTYREALTY", segment: "NSE_INDEX", match: /^nifty\s?realty$/i },
 ];
 
+const NIFTY50_ALIASES = [
+  /^nifty\s?50$/i,
+  /^nifty$/i,
+  /^nifty\s?fifty$/i,
+  /^nifty\s?50\s?index$/i,
+  /^nse\s?nifty\s?50$/i,
+];
+
 function downloadGzip(url) {
   return new Promise((resolve, reject) => {
     https
@@ -34,7 +37,11 @@ function downloadGzip(url) {
         { headers: { "User-Agent": "Mozilla/5.0 (paper-trading-app)" } },
         (res) => {
           if (res.statusCode !== 200) {
-            reject(new Error(`Instrument master download failed: HTTP ${res.statusCode}`));
+            reject(
+              new Error(
+                `Instrument master download failed: HTTP ${res.statusCode}`,
+              ),
+            );
             return;
           }
           const chunks = [];
@@ -47,9 +54,6 @@ function downloadGzip(url) {
   });
 }
 
-let hasLoggedSample = false;
-
-
 function isinFromInstrumentKey(instrumentKey) {
   return instrumentKey?.includes("|") ? instrumentKey.split("|")[1] : null;
 }
@@ -60,66 +64,81 @@ function buildLogoUrl(instrumentKey) {
 }
 
 async function refreshInstrumentMap() {
-  console.log("[INSTRUMENTS] Downloading instrument master (JSON)...");
+  console.log("[INSTRUMENTS] Downloading instrument master...");
   try {
     const gzipped = await downloadGzip(INSTRUMENT_MASTER_URL);
     const jsonText = zlib.gunzipSync(gzipped).toString("utf-8");
     const rows = JSON.parse(jsonText);
 
     if (!Array.isArray(rows)) {
-      throw new Error("Expected a JSON array from the instrument master — got something else.");
+      throw new Error("Expected a JSON array from the instrument master");
     }
-
-    if (!hasLoggedSample && rows.length > 0) {
-      const sampleEq = rows.find((r) => r.segment === "NSE_EQ") || rows[0];
-      console.log("[INSTRUMENTS] Sample NSE_EQ record:", JSON.stringify(sampleEq, null, 2));
-      hasLoggedSample = true;
-    }
-
-
-    const typeCounts = {};
-
-
-    const resolvedIndexKeys = new Set();
-
-
-    const sensexCandidates = [];
 
     const map = {};
     const equities = [];
 
     for (const row of rows) {
       const symbol = row.trading_symbol || row.tradingsymbol || row.symbol;
+      const rowName = row.name || "";
 
+      // NSE Equity stocks
       if (row.segment === "NSE_EQ" && symbol) {
-        typeCounts[row.instrument_type] = (typeCounts[row.instrument_type] || 0) + 1;
-
         map[symbol] = {
           instrumentKey: row.instrument_key,
           name: row.name || symbol,
           logoUrl: buildLogoUrl(row.instrument_key),
           instrumentType: row.instrument_type,
         };
-
-
         if (row.instrument_type === "EQ") {
           equities.push(symbol);
         }
       }
 
-      if (row.segment === "BSE_INDEX" && /sensex/i.test(row.name || "")) {
-        sensexCandidates.push({ name: row.name, instrumentKey: row.instrument_key });
-      }
-
-      for (const def of INDEX_DEFINITIONS) {
-        if (row.segment === def.segment && def.match.test(row.name || "")) {
-          map[def.key] = {
+      // NIFTY50 special handling
+      if (
+        row.segment === "NSE_INDEX" &&
+        NIFTY50_ALIASES.some((re) => re.test(rowName))
+      ) {
+        if (!map["NIFTY50"]) {
+          map["NIFTY50"] = {
             instrumentKey: row.instrument_key,
             name: row.name,
-            logoUrl: null, // indices don't have ISIN-based logos
+            logoUrl: null,
             instrumentType: row.instrument_type,
           };
-          resolvedIndexKeys.add(def.key);
+          console.log(
+            `[INSTRUMENTS] ✅ NIFTY50 resolved: "${row.name}" → ${row.instrument_key}`,
+          );
+        }
+      }
+
+      // SENSEX
+      if (row.segment === "BSE_INDEX" && /sensex/i.test(rowName)) {
+        if (!map["SENSEX"]) {
+          map["SENSEX"] = {
+            instrumentKey: row.instrument_key,
+            name: row.name,
+            logoUrl: null,
+            instrumentType: row.instrument_type,
+          };
+          console.log(
+            `[INSTRUMENTS] ✅ SENSEX resolved: "${row.name}" → ${row.instrument_key}`,
+          );
+        }
+      }
+
+      // Other indices
+      for (const def of INDEX_DEFINITIONS) {
+        if (def.key === "NIFTY50" || def.key === "SENSEX") continue;
+        if (row.segment === def.segment && def.match.test(rowName)) {
+          if (!map[def.key]) {
+            map[def.key] = {
+              instrumentKey: row.instrument_key,
+              name: row.name,
+              logoUrl: null,
+              instrumentType: row.instrument_type,
+            };
+          }
         }
       }
     }
@@ -128,34 +147,14 @@ async function refreshInstrumentMap() {
     equitySymbols = equities;
     lastRefreshedAt = new Date();
 
+    console.log(`[INSTRUMENTS] ✅ Loaded ${Object.keys(map).length} symbols`);
+    console.log(`[INSTRUMENTS] ✅ ${equities.length} tradable equities`);
     console.log(
-      `[INSTRUMENTS] ✅ Loaded ${Object.keys(map).length} symbols (incl. indices) at`,
-      lastRefreshedAt.toLocaleString(),
+      "[INSTRUMENTS] Index check —",
+      INDEX_DEFINITIONS.map(
+        (d) => `${d.key}: ${map[d.key]?.instrumentKey || "NOT FOUND"}`,
+      ).join(" | "),
     );
-    console.log(
-      "[INSTRUMENTS] NSE_EQ instrument_type breakdown:",
-      JSON.stringify(typeCounts),
-    );
-    console.log(
-      `[INSTRUMENTS] ✅ ${equities.length} of those are real tradable equities (instrument_type === "EQ")`,
-    );
-
-    const indexReport = INDEX_DEFINITIONS.map(
-      (def) => `${def.key}: ${map[def.key]?.instrumentKey || "NOT FOUND"}`,
-    ).join(" | ");
-    console.log("[INSTRUMENTS] Index check —", indexReport);
-    console.log(
-      `[INSTRUMENTS] Sensex candidates found (${sensexCandidates.length}):`,
-      JSON.stringify(sensexCandidates),
-    );
-    if (resolvedIndexKeys.size < INDEX_DEFINITIONS.length) {
-      const missing = INDEX_DEFINITIONS.filter((d) => !resolvedIndexKeys.has(d.key)).map(
-        (d) => d.key,
-      );
-      console.warn(
-        `[INSTRUMENTS] ⚠ ${missing.length} tracked indices not resolved: ${missing.join(", ")} — check the instrument master's exact "name" field for these, the regex above may need adjusting.`,
-      );
-    }
   } catch (err) {
     console.error("[INSTRUMENTS] ❌ Refresh failed:", err.message);
   }
@@ -164,14 +163,15 @@ async function refreshInstrumentMap() {
 function getInstrumentKey(symbol) {
   const entry = symbolToInstrumentKey[symbol];
   if (!entry) {
-    console.warn(`[INSTRUMENTS] No instrument_key found for symbol "${symbol}"`);
+    console.warn(
+      `[INSTRUMENTS] No instrument_key found for symbol "${symbol}"`,
+    );
   }
   return entry ? entry.instrumentKey : null;
 }
 
 function getInstrumentName(symbol) {
-  const entry = symbolToInstrumentKey[symbol];
-  return entry ? entry.name : symbol;
+  return symbolToInstrumentKey[symbol]?.name || symbol;
 }
 
 function getInstrumentLogo(symbol) {
@@ -190,8 +190,8 @@ function getMapStatus() {
   };
 }
 
-function scheduleInstrumentRefresh() {
-  refreshInstrumentMap();
+async function scheduleInstrumentRefresh() {
+  await refreshInstrumentMap();
   setInterval(refreshInstrumentMap, 24 * 60 * 60 * 1000);
 }
 

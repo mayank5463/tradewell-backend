@@ -4,20 +4,13 @@ const jwt = require("jsonwebtoken");
 const { UserModel } = require("../models/UserModel");
 const { issueAuthCookie } = require("../utils/issueAuthCookie");
 const { getOrCreateWallet } = require("../services/walletService");
-const { sendEmail } = require("../utils/sendEmail");
-
+const { sendEmail, verificationEmailTemplate, passwordResetEmailTemplate, premiumWelcomeTemplate } = require("../utils/sendEmail");
 
 const tokenBlacklist = new Set();
-
-const failedLogins = new Map(); // email -> { count, lockedUntil }
-
+const failedLogins = new Map();
 const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
-
-
-const resetTokens = new Map(); // hashedToken -> { userId, expires }
-
-// ── EMAIL VERIFICATION TOKENS ───────────────────────────────────────────
+const LOCKOUT_DURATION = 15 * 60 * 1000;
+const resetTokens = new Map();
 const verificationTokens = new Map();
 
 // ── HELPER: Check if account is locked ─────────────────────────────────
@@ -29,7 +22,6 @@ function isAccountLocked(email) {
     return true;
   }
 
-  // Reset if lock expired
   if (record.lockedUntil && record.lockedUntil <= Date.now()) {
     failedLogins.delete(email);
     return false;
@@ -60,15 +52,9 @@ function clearFailedLogins(email) {
 // ── HELPER: Add token to blacklist ─────────────────────────────────────
 function blacklistToken(token) {
   tokenBlacklist.add(token);
-
-  // Auto-clean expired tokens (prevent memory leak)
-  // WHY: Tokens expire anyway, no need to keep them forever
-  setTimeout(
-    () => {
-      tokenBlacklist.delete(token);
-    },
-    24 * 60 * 60 * 1000,
-  ); // 24 hours (matches JWT expiry)
+  setTimeout(() => {
+    tokenBlacklist.delete(token);
+  }, 24 * 60 * 60 * 1000);
 }
 
 // ── HELPER: Check if token is blacklisted ──────────────────────────────
@@ -77,7 +63,6 @@ function isTokenBlacklisted(token) {
 }
 
 // ── HELPER: Validate password strength ─────────────────────────────────
-// WHY: Weak passwords are easily cracked by dictionary/brute force attacks
 function validatePasswordStrength(password) {
   const checks = {
     minLength: password.length >= 8,
@@ -98,33 +83,27 @@ function validatePasswordStrength(password) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// POST /signup - Advanced Signup with Email Verification
+// POST /signup - Advanced Signup with Email Verification & Premium Support
 // ══════════════════════════════════════════════════════════════════════
 async function signup(req, res) {
-  console.log("[SIGNUP] Incoming body:", { ...req.body, password: "•••••••" });
-  const { name, email, password } = req.body;
+  console.log("[SIGNUP] Incoming request from:", req.headers.origin);
+
+  const { name, email, password, isPremium } = req.body;
 
   // ── Basic Validation ─────────────────────────────────────────────────
   if (!name || !email || !password) {
-    console.warn("[SIGNUP] Rejected: missing fields");
     return res.status(400).json({ message: "All fields are required." });
   }
 
-  // ── Name Validation ──────────────────────────────────────────────────
-  // WHY: Prevents XSS and ensures clean data
   if (name.trim().length < 2 || name.trim().length > 50) {
     return res.status(400).json({ message: "Name must be 2-50 characters." });
   }
 
-  // ── Email Validation ─────────────────────────────────────────────────
   if (!/\S+@\S+\.\S+/.test(email)) {
-    return res
-      .status(400)
-      .json({ message: "Please enter a valid email address." });
+    return res.status(400).json({ message: "Please enter a valid email address." });
   }
 
   // ── Password Strength Validation ─────────────────────────────────────
-  // WHY: Enforces strong passwords to prevent easy brute force
   const passwordCheck = validatePasswordStrength(password);
   if (!passwordCheck.isValid) {
     const messages = {
@@ -150,71 +129,61 @@ async function signup(req, res) {
     // ── Check Existing User ─────────────────────────────────────────────
     const existing = await UserModel.findOne({ email: normalizedEmail });
     if (existing) {
-      // WHY: Don't reveal if email exists (prevents user enumeration)
-      console.warn(
-        "[SIGNUP] Rejected: email already registered →",
-        normalizedEmail,
-      );
+      console.warn("[SIGNUP] Email already registered:", normalizedEmail);
       return res.status(400).json({
-        message: "This email is already registered. Please login.",
+        message: "This email is already registered. Please login instead.",
       });
     }
 
     // ── Hash Password ──────────────────────────────────────────────────
-    // WHY: bcrypt with 12 rounds = secure against brute force
-    // 10 rounds = fast crackable, 12+ rounds = secure
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    // ── Create User ─────────────────────────────────────────────────────
+    // ── Create User with Premium Support ───────────────────────────────
     const newUser = new UserModel({
       name: name.trim(),
       email: normalizedEmail,
       password: hashedPassword,
-      isEmailVerified: false, // Require email verification
-      createdAt: new Date(),
+      isEmailVerified: false,
+      isPremium: isPremium === true,
+      premiumExpiresAt: isPremium ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) : null,
+      premiumActivatedAt: isPremium ? new Date() : null,
     });
-    await newUser.save();
 
-    console.log(
-      "[SIGNUP] ✅ New user saved:",
-      newUser.email,
-      "| id:",
-      newUser._id,
-    );
+    await newUser.save();
+    console.log("[SIGNUP] ✅ New user created:", newUser.email, "| Premium:", isPremium);
 
     // ── Create Wallet ───────────────────────────────────────────────────
-    // WHY: Every account gets wallet immediately, can't be skipped
     await getOrCreateWallet(newUser._id);
 
     // ── Generate Email Verification Token ──────────────────────────────
-    // WHY: Prevents fake accounts and spam
     const verificationToken = crypto.randomBytes(32).toString("hex");
     verificationTokens.set(verificationToken, {
       userId: newUser._id,
-      expires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+      expires: Date.now() + 24 * 60 * 60 * 1000,
     });
 
     // ── Send Verification Email ────────────────────────────────────────
+    const verificationLink = `${process.env.FRONTEND_URL}/verify-email/${verificationToken}`;
+
     try {
+      const emailTemplate = isPremium
+        ? premiumWelcomeTemplate(verificationLink, newUser.name)
+        : verificationEmailTemplate(verificationLink, newUser.name);
+
       await sendEmail({
         to: newUser.email,
-        subject: "Verify your Tradewell account",
-        html: `
-          <h1>Welcome to Tradewell!</h1>
-          <p>Click the link below to verify your email:</p>
-          <a href="${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}">
-            Verify Email
-          </a>
-          <p>This link expires in 24 hours.</p>
-        `,
+        subject: isPremium
+          ? "🎉 Welcome to Tradewell Premium!"
+          : "Verify your Tradewell account",
+        html: emailTemplate,
       });
-      console.log("[SIGNUP] Verification email sent to:", newUser.email);
+      console.log("[SIGNUP] Email sent to:", newUser.email);
     } catch (emailError) {
-      // Don't fail signup if email fails - user can resend
       console.error("[SIGNUP] Email send failed:", emailError.message);
+      // Don't fail signup if email fails
     }
 
-    // ── Issue Auth Cookie (Auto-login) ─────────────────────────────────
+    // ── Issue Auth Cookie ──────────────────────────────────────────────
     issueAuthCookie(res, newUser);
 
     return res.status(201).json({
@@ -224,16 +193,16 @@ async function signup(req, res) {
         name: newUser.name,
         email: newUser.email,
         isEmailVerified: false,
+        isPremium: isPremium || false,
       },
     });
   } catch (err) {
+    console.error("[SIGNUP] Error:", err.message);
     if (err.code === 11000) {
-      console.error("[SIGNUP] Duplicate key error:", err.message);
       return res.status(400).json({
         message: "Email already registered. Please login.",
       });
     }
-    console.error("[SIGNUP] ❌ Unexpected error:", err.message);
     return res.status(500).json({
       message: "Server error. Please try again.",
     });
@@ -241,56 +210,48 @@ async function signup(req, res) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// POST /login - Advanced Login with Account Lockout
+// POST /login - Advanced Login with Account Lockout & Premium Check
 // ══════════════════════════════════════════════════════════════════════
 async function login(req, res) {
-  console.log("[LOGIN] Incoming body:", { ...req.body, password: "•••••••" });
   const { email, password } = req.body;
 
-  // ── Basic Validation ─────────────────────────────────────────────────
   if (!email || !password) {
-    return res
-      .status(400)
-      .json({ message: "Email and password are required." });
+    return res.status(400).json({ message: "Email and password are required." });
   }
 
   const normalizedEmail = email.toLowerCase().trim();
 
   // ── Check Account Lockout ────────────────────────────────────────────
-  // WHY: Prevents brute force even with distributed IPs
   if (isAccountLocked(normalizedEmail)) {
     const record = failedLogins.get(normalizedEmail);
     const minutesLeft = Math.ceil((record.lockedUntil - Date.now()) / 60000);
-    console.warn(
-      `[SECURITY] Login blocked for locked account: ${normalizedEmail}`,
-    );
     return res.status(423).json({
       message: `Account temporarily locked. Try again in ${minutesLeft} minutes.`,
     });
   }
 
   try {
-    const user = await UserModel.findOne({ email: normalizedEmail });
+    // FIX: `password` has `select: false` on the schema, so a plain
+    // findOne() never returns it. Without `.select("+password")` here,
+    // `user.password` is `undefined` and bcrypt.compare() either throws
+    // or always fails — every login attempt was breaking on this line.
+    const user = await UserModel.findOne({ email: normalizedEmail }).select("+password");
 
-    // ── Generic Error Message ──────────────────────────────────────────
-    // WHY: Don't reveal if email exists (prevents user enumeration)
     if (!user) {
-      console.warn("[LOGIN] No user found for:", normalizedEmail);
+      recordFailedLogin(normalizedEmail);
       return res.status(400).json({ message: "Invalid email or password." });
     }
 
     // ── Password Verification ──────────────────────────────────────────
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      // Record failed attempt for account lockout
       recordFailedLogin(normalizedEmail);
-      console.warn("[LOGIN] Password mismatch for:", normalizedEmail);
       return res.status(400).json({ message: "Invalid email or password." });
     }
 
     // ── Clear Failed Attempts on Success ───────────────────────────────
     clearFailedLogins(normalizedEmail);
-    console.log("[LOGIN] ✅ Password verified for:", user.email);
+    console.log("[LOGIN] ✅ User logged in:", user.email);
 
     // ── Create Wallet if Missing ───────────────────────────────────────
     await getOrCreateWallet(user._id);
@@ -305,10 +266,12 @@ async function login(req, res) {
         name: user.name,
         email: user.email,
         isEmailVerified: user.isEmailVerified,
+        isPremium: user.isPremium || false,
+        premiumExpiresAt: user.premiumExpiresAt,
       },
     });
   } catch (err) {
-    console.error("[LOGIN] ❌ Unexpected error:", err.message);
+    console.error("[LOGIN] Error:", err.message);
     return res.status(500).json({ message: "Server error. Please try again." });
   }
 }
@@ -317,39 +280,27 @@ async function login(req, res) {
 // POST /logout - Fixed Logout with Token Blacklist
 // ══════════════════════════════════════════════════════════════════════
 function logout(req, res) {
-  console.log(
-    "[LOGOUT] Clearing token cookie. Was present:",
-    !!req.cookies?.token,
-  );
-
-  // ── Extract Token for Blacklisting ───────────────────────────────────
   const token = req.cookies?.token;
 
   if (token) {
-    // Add to blacklist so it can't be reused
     blacklistToken(token);
-    console.log("[LOGOUT] Token blacklisted");
+    console.log("[LOGOUT] Token blacklisted for user:", req.user?.email);
   }
 
-  // ── Clear Cookie with EXACT Same Options ─────────────────────────────
-  // WHY: Cookie won't clear if options don't match
-  // CRITICAL FIX: Must match the options used in issueAuthCookie
-  res.clearCookie("token", {
+  const isProd = process.env.NODE_ENV === "production";
+  const cookieOpts = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-    path: "/",
-    expires: new Date(0), // Set to past date to force deletion
-  });
-
-  // Also clear any other cookies
-  res.clearCookie("refreshToken", {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
     path: "/",
     expires: new Date(0),
-  });
+  };
+
+  // Clear both cookies your issue/verify flow could ever set, not just
+  // "token" — harmless today, and avoids a stale leftover cookie if a
+  // refresh-token flow gets added later.
+  res.clearCookie("token", cookieOpts);
+  res.clearCookie("refreshToken", cookieOpts);
 
   return res.json({ message: "Logged out successfully.", success: true });
 }
@@ -358,22 +309,21 @@ function logout(req, res) {
 // GET /check-auth - Enhanced with Blacklist Check
 // ══════════════════════════════════════════════════════════════════════
 function checkAuth(req, res) {
-  // AuthMiddleware already verified the token
-  // But check if token is blacklisted (logged out)
-  const token = req.cookies?.token;
+  // AuthMiddleware already verified the token and set req.user
+  if (!req.user || !req.user.id) {
+    return res.status(401).json({
+      isAuthenticated: false,
+      message: "Not authenticated",
+    });
+  }
 
+  // Check if token is blacklisted
+  const token = req.cookies?.token;
   if (token && isTokenBlacklisted(token)) {
     console.warn("[CHECK-AUTH] Blacklisted token used");
     return res.status(401).json({
       isAuthenticated: false,
       message: "Session expired. Please login again.",
-    });
-  }
-
-  if (!req.user || !req.user.id) {
-    return res.status(401).json({
-      isAuthenticated: false,
-      message: "Not authenticated",
     });
   }
 
@@ -388,7 +338,7 @@ function checkAuth(req, res) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// GET /profile - Enhanced with Email Verification Status
+// GET /profile - Get User Profile
 // ══════════════════════════════════════════════════════════════════════
 async function getProfile(req, res) {
   try {
@@ -398,20 +348,20 @@ async function getProfile(req, res) {
     }
     return res.json(user);
   } catch (err) {
-    console.error("[PROFILE] ❌ Error:", err.message);
+    console.error("[PROFILE] Error:", err.message);
     return res.status(500).json({ message: "Failed to fetch profile." });
   }
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// POST /change-password - Enhanced with Better Validation
+// POST /change-password - Change Password
 // ══════════════════════════════════════════════════════════════════════
 async function changePassword(req, res) {
   const { currentPassword, newPassword } = req.body;
 
   if (!currentPassword || !newPassword) {
     return res.status(400).json({
-      error: "Current and new password are both required.",
+      message: "Current and new password are both required.",
     });
   }
 
@@ -419,41 +369,36 @@ async function changePassword(req, res) {
   const passwordCheck = validatePasswordStrength(newPassword);
   if (!passwordCheck.isValid) {
     return res.status(400).json({
-      error:
-        "New password must be at least 8 characters with uppercase, lowercase, number, and special character.",
+      message: "New password must be at least 8 characters with uppercase, lowercase, number, and special character.",
     });
   }
 
   try {
-    const user = await UserModel.findById(req.user.id);
+    // Same fix as login: need the actual hash back to compare against.
+    const user = await UserModel.findById(req.user.id).select("+password");
     if (!user) {
-      return res.status(404).json({ error: "User not found." });
+      return res.status(404).json({ message: "User not found." });
     }
 
     const isMatch = await bcrypt.compare(currentPassword, user.password);
     if (!isMatch) {
-      console.warn(
-        "[CHANGE-PASSWORD] Current password mismatch for:",
-        user.email,
-      );
-      return res.status(401).json({ error: "Current password is incorrect." });
+      return res.status(401).json({ message: "Current password is incorrect." });
     }
 
     if (currentPassword === newPassword) {
       return res.status(400).json({
-        error: "New password must be different from current password.",
+        message: "New password must be different from current password.",
       });
     }
 
-    // ── Hash with 12 rounds (upgrade from 10) ──────────────────────────
     user.password = await bcrypt.hash(newPassword, 12);
     await user.save();
 
     console.log("[CHANGE-PASSWORD] ✅ Password updated for:", user.email);
     return res.json({ message: "Password updated successfully." });
   } catch (err) {
-    console.error("[CHANGE-PASSWORD] ❌ Unexpected error:", err.message);
-    return res.status(500).json({ error: "Server error. Please try again." });
+    console.error("[CHANGE-PASSWORD] Error:", err.message);
+    return res.status(500).json({ message: "Server error. Please try again." });
   }
 }
 
@@ -472,13 +417,13 @@ async function forgotPassword(req, res) {
   try {
     const user = await UserModel.findOne({ email: normalizedEmail });
 
-    // ── Always Return Same Response ────────────────────────────────────
-    // WHY: Prevents user enumeration (don't reveal if email exists)
+    // ── Always Return Same Response (Prevent User Enumeration) ─────────
     const genericResponse = {
-      message: "If that email exists, a reset link has been sent.",
+      message: "If that email is registered, a reset link has been sent. Check your inbox.",
     };
 
     if (!user) {
+      console.log("[FORGOT-PASSWORD] Email not found:", normalizedEmail);
       return res.json(genericResponse);
     }
 
@@ -489,31 +434,31 @@ async function forgotPassword(req, res) {
       .update(resetToken)
       .digest("hex");
 
-    // Store hashed token (not plain text)
+    // ── Store hashed token (NEVER store plain text) ──────────────────
     resetTokens.set(hashedToken, {
       userId: user._id,
       expires: Date.now() + 30 * 60 * 1000, // 30 minutes
     });
 
+    console.log("[FORGOT-PASSWORD] Reset token created for:", user.email);
+
     // ── Send Reset Email ───────────────────────────────────────────────
-    const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+    const resetLink = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
 
-    await sendEmail({
-      to: user.email,
-      subject: "Reset your Tradewell password",
-      html: `
-        <h1>Password Reset Request</h1>
-        <p>Click the link below to reset your password:</p>
-        <a href="${resetLink}">Reset Password</a>
-        <p>This link expires in 30 minutes.</p>
-        <p>If you didn't request this, please ignore this email.</p>
-      `,
-    });
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: "🔐 Reset your Tradewell password",
+        html: passwordResetEmailTemplate(resetLink, user.name),
+      });
+      console.log("[FORGOT-PASSWORD] Email sent to:", user.email);
+    } catch (emailError) {
+      console.error("[FORGOT-PASSWORD] Email failed:", emailError.message);
+    }
 
-    console.log("[FORGOT-PASSWORD] Reset email sent to:", user.email);
     return res.json(genericResponse);
   } catch (err) {
-    console.error("[FORGOT-PASSWORD] ❌ Error:", err.message);
+    console.error("[FORGOT-PASSWORD] Error:", err.message);
     return res.status(500).json({ message: "Server error. Please try again." });
   }
 }
@@ -525,17 +470,16 @@ async function resetPassword(req, res) {
   const { token, newPassword } = req.body;
 
   if (!token || !newPassword) {
-    return res
-      .status(400)
-      .json({ message: "Token and new password are required." });
+    return res.status(400).json({
+      message: "Token and new password are required.",
+    });
   }
 
   // ── Validate Password Strength ───────────────────────────────────────
   const passwordCheck = validatePasswordStrength(newPassword);
   if (!passwordCheck.isValid) {
     return res.status(400).json({
-      message:
-        "Password must be at least 8 characters with uppercase, lowercase, number, and special character.",
+      message: "Password must be at least 8 characters with uppercase, lowercase, number, and special character.",
     });
   }
 
@@ -546,14 +490,18 @@ async function resetPassword(req, res) {
 
     // ── Validate Token ─────────────────────────────────────────────────
     if (!tokenData) {
-      return res
-        .status(400)
-        .json({ message: "Invalid or expired reset token." });
+      console.warn("[RESET-PASSWORD] Invalid token attempted");
+      return res.status(400).json({
+        message: "Invalid reset link. Please request a new one.",
+      });
     }
 
     if (tokenData.expires < Date.now()) {
       resetTokens.delete(hashedToken);
-      return res.status(400).json({ message: "Reset token has expired." });
+      console.warn("[RESET-PASSWORD] Token expired");
+      return res.status(400).json({
+        message: "Reset link has expired. Please request a new one.",
+      });
     }
 
     // ── Update Password ────────────────────────────────────────────────
@@ -571,7 +519,7 @@ async function resetPassword(req, res) {
     console.log("[RESET-PASSWORD] ✅ Password reset for:", user.email);
     return res.json({ message: "Password reset successfully. Please login." });
   } catch (err) {
-    console.error("[RESET-PASSWORD] ❌ Error:", err.message);
+    console.error("[RESET-PASSWORD] Error:", err.message);
     return res.status(500).json({ message: "Server error. Please try again." });
   }
 }
@@ -582,18 +530,24 @@ async function resetPassword(req, res) {
 async function verifyEmail(req, res) {
   const { token } = req.params;
 
+  if (!token) {
+    return res.status(400).json({ message: "Verification token is required." });
+  }
+
   try {
     const tokenData = verificationTokens.get(token);
 
     if (!tokenData) {
-      return res.status(400).json({ message: "Invalid verification token." });
+      return res.status(400).json({
+        message: "Invalid verification link. Please request a new one.",
+      });
     }
 
     if (tokenData.expires < Date.now()) {
       verificationTokens.delete(token);
-      return res
-        .status(400)
-        .json({ message: "Verification token has expired." });
+      return res.status(400).json({
+        message: "Verification link has expired. Please request a new one.",
+      });
     }
 
     const user = await UserModel.findById(tokenData.userId);
@@ -601,15 +555,27 @@ async function verifyEmail(req, res) {
       return res.status(404).json({ message: "User not found." });
     }
 
+    if (user.isEmailVerified) {
+      return res.status(400).json({ message: "Email is already verified." });
+    }
+
     user.isEmailVerified = true;
+    user.emailVerifiedAt = new Date();
     await user.save();
 
     verificationTokens.delete(token);
 
     console.log("[VERIFY-EMAIL] ✅ Email verified for:", user.email);
-    return res.json({ message: "Email verified successfully!" });
+    return res.json({
+      message: "Email verified successfully! You can now access all features.",
+      user: {
+        id: user._id,
+        email: user.email,
+        isEmailVerified: true,
+      },
+    });
   } catch (err) {
-    console.error("[VERIFY-EMAIL] ❌ Error:", err.message);
+    console.error("[VERIFY-EMAIL] Error:", err.message);
     return res.status(500).json({ message: "Server error. Please try again." });
   }
 }
@@ -627,13 +593,16 @@ async function resendVerification(req, res) {
   try {
     const user = await UserModel.findOne({ email: email.toLowerCase().trim() });
 
+    const genericResponse = {
+      message: "If that email exists and is unverified, a verification link has been sent.",
+    };
+
     if (!user) {
-      // Don't reveal if email exists
-      return res.json({ message: "If that email exists, verification sent." });
+      return res.json(genericResponse);
     }
 
     if (user.isEmailVerified) {
-      return res.status(400).json({ message: "Email already verified." });
+      return res.json(genericResponse);
     }
 
     const verificationToken = crypto.randomBytes(32).toString("hex");
@@ -642,22 +611,67 @@ async function resendVerification(req, res) {
       expires: Date.now() + 24 * 60 * 60 * 1000,
     });
 
+    const verificationLink = `${process.env.FRONTEND_URL}/verify-email/${verificationToken}`;
+
     await sendEmail({
       to: user.email,
-      subject: "Verify your Tradewell account",
-      html: `
-        <h1>Verify your email</h1>
-        <p>Click below to verify:</p>
-        <a href="${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}">
-          Verify Email
-        </a>
-      `,
+      subject: "✉️ Verify your Tradewell account",
+      html: verificationEmailTemplate(verificationLink, user.name),
     });
 
-    return res.json({ message: "Verification email sent." });
+    console.log("[RESEND-VERIFICATION] Email sent to:", user.email);
+    return res.json(genericResponse);
   } catch (err) {
-    console.error("[RESEND-VERIFICATION] ❌ Error:", err.message);
-    return res.status(500).json({ message: "Server error." });
+    console.error("[RESEND-VERIFICATION] Error:", err.message);
+    return res.status(500).json({ message: "Server error. Please try again." });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// PUT /update-profile - Update User Profile
+// ══════════════════════════════════════════════════════════════════════
+async function updateProfile(req, res) {
+  const { name, phone, pan, gender, dob, address, city, state, pincode } = req.body;
+
+  try {
+    const user = await UserModel.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Update only provided fields
+    if (name !== undefined) user.name = name.trim();
+    if (phone !== undefined) user.phone = phone.trim();
+    if (pan !== undefined) user.pan = pan.trim().toUpperCase();
+    if (gender !== undefined) user.gender = gender;
+    if (dob !== undefined) user.dob = dob;
+    if (address !== undefined) user.address = address.trim();
+    if (city !== undefined) user.city = city.trim();
+    if (state !== undefined) user.state = state.trim();
+    if (pincode !== undefined) user.pincode = pincode.trim();
+
+    await user.save();
+
+    console.log("[UPDATE-PROFILE] ✅ Profile updated for:", user.email);
+    return res.json({
+      message: "Profile updated successfully.",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        pan: user.pan,
+        gender: user.gender,
+        dob: user.dob,
+        address: user.address,
+        city: user.city,
+        state: user.state,
+        pincode: user.pincode,
+      },
+    });
+  } catch (err) {
+    console.error("[UPDATE-PROFILE] Error:", err.message);
+    return res.status(500).json({ message: "Failed to update profile." });
   }
 }
 
@@ -672,4 +686,5 @@ module.exports = {
   resetPassword,
   verifyEmail,
   resendVerification,
+  updateProfile,
 };

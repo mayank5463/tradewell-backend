@@ -14,9 +14,10 @@ const {
   resetPassword,
   verifyEmail,
   resendVerification,
+  updateProfile,
 } = require("../controllers/authController");
 
-// RATE LIMITERS 
+// RATE LIMITERS
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -24,19 +25,23 @@ const loginLimiter = rateLimit({
   skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { message: "Too many login attempts. Please try again in 15 minutes." }
+  message: {
+    message: "Too many login attempts. Please try again in 15 minutes.",
+  },
 });
 
 const signupLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 3,
-  message: { message: "Too many accounts created. Please try again later." }
+  message: { message: "Too many accounts created. Please try again later." },
 });
 
 const passwordResetLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 3,
-  message: { message: "Too many password reset requests. Please try again later." }
+  message: {
+    message: "Too many password reset requests. Please try again later.",
+  },
 });
 
 // ── PUBLIC ROUTES (No Auth Required) ────────────────────────────────────
@@ -48,11 +53,13 @@ router.post("/reset-password", resetPassword);
 router.get("/verify-email/:token", verifyEmail);
 router.post("/resend-verification", resendVerification);
 
+// ── PROTECTED ROUTES ────────────────────────────────────────────────────
 
-router.post("/logout", logout); 
-
+// FIX: check-auth uses AuthMiddleware to verify token
 router.get("/check-auth", AuthMiddleware, checkAuth);
+router.post("/logout", AuthMiddleware, logout);
 router.get("/profile", AuthMiddleware, getProfile);
 router.post("/change-password", AuthMiddleware, changePassword);
+router.put("/update-profile", AuthMiddleware, updateProfile);
 
 module.exports = router;
