@@ -18,6 +18,10 @@ const {
 } = require("../controllers/authController");
 
 // RATE LIMITERS
+// These are the ONLY rate limiters applied to these paths now — the
+// old duplicate `authLimiter` (20/15min) that also lived in app.js has
+// been removed since it was redundant with these, more precisely
+// tuned, per-route limiters.
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -55,8 +59,11 @@ router.post("/resend-verification", resendVerification);
 
 // ── PROTECTED ROUTES ────────────────────────────────────────────────────
 
-// FIX: check-auth uses AuthMiddleware to verify token
 router.get("/check-auth", AuthMiddleware, checkAuth);
+
+// csrfGuard is now applied globally in app.js to every non-GET route in
+// the whole app, not just these three — see middleware/csrfGuard.js for
+// why. No per-route wiring needed here anymore.
 router.post("/logout", AuthMiddleware, logout);
 router.get("/profile", AuthMiddleware, getProfile);
 router.post("/change-password", AuthMiddleware, changePassword);

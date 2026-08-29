@@ -18,6 +18,10 @@ console.log(
   "(default fallback if unset)",
 );
 console.log(
+  "  NODE_ENV             :",
+  process.env.NODE_ENV || "❌ MISSING (cookies will use dev/local settings!)",
+);
+console.log(
   "  FRONTEND_URL        :",
   process.env.FRONTEND_URL || "❌ MISSING",
 );
@@ -35,7 +39,15 @@ console.log(
     ? `✅ loaded (starts with ${process.env.INDIANAPI_KEY.slice(0, 4)}...)`
     : "❌ MISSING",
 );
-console.log("─────────────────────────────���───────────────");
+console.log("─────────────────────────────────────────────");
+
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[UNHANDLED REJECTION]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
+});
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -43,6 +55,7 @@ const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const { csrfGuard } = require("./middleware/csrfGuard");
 
 // Routes imports
 const authRoutes = require("./routes/authRoutes");
@@ -95,6 +108,13 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
+// Applied globally, once, for every non-GET route in the app — see the
+// comment at the top of middleware/csrfGuard.js for why this moved here
+// instead of being wired onto individual routes by hand. Both frontends
+// already send the required header on every request, so this is a
+// backend-only change with nothing to update client-side.
+app.use(csrfGuard);
+
 // Sanitize inputs
 function sanitizeInPlace(obj) {
   if (!obj || typeof obj !== "object") return;
@@ -117,6 +137,14 @@ app.use((req, res, next) => {
 });
 
 // Global rate limiter
+// FIX: this used to ALSO apply a second, looser (20/15min) limiter to
+// /login, /signup, /change-password via the `authLimiter` below — while
+// authRoutes.js applies its own, stricter, per-route limiters
+// (loginLimiter: 5/15min, signupLimiter: 3/hour) to those exact same
+// paths. Whichever limiter fires first wins in practice, so the two
+// were redundant; the route-level ones are more precisely tuned per
+// endpoint, so the duplicate global authLimiter has been removed
+// entirely. Only the general-purpose limiter remains here.
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 300,
@@ -124,16 +152,6 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use(globalLimiter);
-
-// Auth rate limiter
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { message: "Too many attempts. Please try again in a few minutes." },
-});
-app.use(["/login", "/signup", "/change-password"], authLimiter);
 
 // Request logging
 app.use((req, res, next) => {
@@ -184,6 +202,12 @@ async function startServer() {
   }
   if (allowedOrigins.length === 0) {
     console.warn("⚠️  No FRONTEND_URL/DASHBOARD_URL set — cross-origin requests will be BLOCKED.");
+  }
+  if (process.env.NODE_ENV !== "production") {
+    console.warn(
+      "⚠️  NODE_ENV is not 'production'. Auth cookies will use sameSite:'lax' and secure:false, " +
+        "which BREAKS cross-domain login between Vercel and Render. Set NODE_ENV=production on Render.",
+    );
   }
   if (!process.env.INDIANAPI_KEY) {
     console.warn("⚠️  INDIANAPI_KEY is missing from .env — /market/company/:symbol requests will fail.");
