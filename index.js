@@ -72,8 +72,8 @@ app.use(helmet());
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:3001",
-  "https://tradewell-marketing.vercel.app",
-  "https://tradewell-dashboard.vercel.app",
+  process.env.FRONTEND_URL,
+  process.env.DASHBOARD_URL,
 ].filter(Boolean);
 
 console.log("[BOOT] CORS allowed origins:", allowedOrigins);
